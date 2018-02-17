@@ -22,10 +22,6 @@ import { convert, Tensor } from "./tensor";
 import * as types from "./types";
 import { assert, assertEqual, CounterMap, log } from "./util";
 
-// The global tape stack. The tape stack is used to support higher order
-// gradients.
-const tapeStack: Tape[] = [];
-
 // Hacky. How does one define methods on interfaces?
 function tapeEntryToString(e: types.TapeEntry): string {
   const i = e.inputIds.toString();
@@ -72,6 +68,10 @@ export class Tape {
   }
 }
 
+// The global tape stack. The tape stack is used to support higher order
+// gradients. It always starts with a tape - to support top-level traces.
+const tapeStack: Tape[] = [new Tape()];
+
 /** Returns a function which differentiates f with respect to the given
  * argnum indexes.
  */
@@ -91,6 +91,7 @@ export interface ParamsFn {
 
 export interface NamedGrads { [name: string]: Tensor; }
 
+// TODO remove or replace this in favor of gradParams2 once unused.
 export function gradParams(f: ParamsFn, names?: string[]) {
   return function(params: Params): [NamedGrads, Tensor] {
     pushNewTape();
@@ -123,6 +124,35 @@ export function gradParams(f: ParamsFn, names?: string[]) {
     }
     return [out, result];
   };
+}
+
+/** Take the gradient of the specified tensor with respect to the provided
+ * parameters. The user is responsible for calling trace on each of the params
+ * before calculating x.
+ */
+export function gradParams2(x: Tensor, params: Params): NamedGrads {
+  // Turn params into an array, so it can be
+  // processed by imperativeGrad.
+  const order: string[] = [];
+  const targs: Tensor[] = [];
+  params.forEach((t, name) => {
+    order.push(name);
+    targs.push(t);
+  });
+
+  assert(tapeStack.length > 0);
+  const tape = tapeStack[tapeStack.length - 1];
+  const grads = imperativeGrad2(x, targs, tape);
+
+  // Now grads is an array, which we want to turn back into a params object.
+  // TODO share this with gradParams
+  assert(grads.length === order.length);
+  const out: NamedGrads = {};
+  for (let i = 0; i < order.length; ++i) {
+    const n = order[i];
+    out[n] = grads[i];
+  }
+  return out;
 }
 
 export function multigradAndVal(f, argnums?: number[]) {
@@ -175,6 +205,12 @@ export function gradAndVal(f, argnum = 0) {
 function imperativeGrad(target: Tensor,
                         sources: Tensor[]): Tensor[] {
   const tape = popTape();
+  return imperativeGrad2(target, sources, tape);
+}
+
+function imperativeGrad2(target: Tensor,
+                         sources: Tensor[],
+                         tape: Tape): Tensor[] {
   const readyOps: number[] = [];
   const sourceIds = new Set(sources.map((t) => t.id));
 
@@ -323,7 +359,7 @@ export function popTape(): Tape {
 }
 
 // Marks this tensor to be watched by all tapes in the stack.
-function watch(t: Tensor) {
+export function watch(t: Tensor) {
   for (const tape of tapeStack) {
     tape.watch(t);
   }
